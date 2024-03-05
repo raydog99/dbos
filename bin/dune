@@ -1,0 +1,4 @@
+(executable
+ (public_name dbos)
+ (name main)
+ (libraries dbos))
