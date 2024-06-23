@@ -1,0 +1,4 @@
+(executable
+ (public_name bluefin)
+ (name main)
+ (libraries bluefin))
