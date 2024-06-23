@@ -1,0 +1,3 @@
+# mako
+
+Permissionless categorical DBMS

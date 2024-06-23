@@ -1,0 +1,5 @@
+# dune init proj mako
+# OCAMLPARAM: unset
+# Shared cache: disabled
+# Workspace root: /Users/raymonddeng/Desktop/github/dbos/mako
+# Auto-detected concurrency: 8
