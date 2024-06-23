@@ -1,0 +1,5 @@
+# dune init proj barracuda
+# OCAMLPARAM: unset
+# Shared cache: disabled
+# Workspace root: /Users/raymonddeng/Desktop/github/dbos/barracuda
+# Auto-detected concurrency: 8
