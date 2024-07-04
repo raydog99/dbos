@@ -1,0 +1,4 @@
+(library
+ (name storage)
+ (libraries sync_primitives)
+ (modules (:standard)))

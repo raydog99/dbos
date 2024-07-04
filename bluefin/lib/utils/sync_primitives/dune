@@ -1,0 +1,3 @@
+(library
+ (name sync_primitives)
+ (modules latch))

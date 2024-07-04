@@ -1,100 +1,116 @@
-(* Constants *)
-let page_size = 4 * 1024
-let effective_page_size = page_size - 24 (* Adjusted for OCaml's lack of exact C-style struct packing *)
+open Sync_primitives
 
-(* Types *)
+type state = FREE | HOT | COOL | LOADED
+
+let page_size = 4 * 1024
+
+type pid = int64
 type worker_id = int
 type lid = int64
-type pid = int64
 type dtid = int
 
-(* Enums *)
-type state = Free | Hot | Cool | Loaded
+module Page : sig
+  type t = {
+    mutable plsn: lid;
+    mutable gsn: lid;
+    mutable dt_id: dtid;
+    mutable magic_debugging_number: int64;
+    mutable dt: bytes;
+  }
+  val create : unit -> t
+end = struct
+  type t = {
+    mutable plsn: lid;
+    mutable gsn: lid;
+    mutable dt_id: dtid;
+    mutable magic_debugging_number: int64;
+    mutable dt: bytes;
+  }
 
-(* Structures *)
-type content_tracker = {
-  mutable restarts_counter: int;
-  mutable access_counter: int;
-  mutable last_modified_pos: int;
-}
-
-type optimistic_parent_pointer = {
-  mutable parent_bf: buffer_frame option;
-  mutable parent_pid: pid;
-  mutable parent_plsn: lid;
-  mutable swip_ptr: buffer_frame option ref option;
-  mutable pos_in_parent: int;
-}
-
-and buffer_frame = {
-  mutable last_writer_worker_id: worker_id;
-  mutable last_written_plsn: lid;
-  mutable state: state;
-  mutable is_being_written_back: bool;
-  mutable keep_in_memory: bool;
-  mutable pid: pid;
-  mutable latch: int64; (* Simplified latch representation *)
-  mutable next_free_bf: buffer_frame option;
-  mutable contention_tracker: content_tracker;
-  mutable optimistic_parent_pointer: optimistic_parent_pointer;
-  mutable crc: int64;
-  mutable plsn: lid;
-  mutable gsn: lid;
-  mutable dt_id: dtid;
-  mutable magic_debugging_number: int64;
-  mutable dt: bytes;
-}
-
-(* Functions *)
-let create_buffer_frame () =
-  {
-    last_writer_worker_id = max_int;
-    last_written_plsn = 0L;
-    state = Free;
-    is_being_written_back = false;
-    keep_in_memory = false;
-    pid = 9999L;
-    latch = 0L;
-    next_free_bf = None;
-    contention_tracker = { restarts_counter = 0; access_counter = 0; last_modified_pos = -1 };
-    optimistic_parent_pointer = {
-      parent_bf = None;
-      parent_pid = 0L;
-      parent_plsn = 0L;
-      swip_ptr = None;
-      pos_in_parent = -1;
-    };
-    crc = 0L;
+  let create () = {
     plsn = 0L;
     gsn = 0L;
     dt_id = 9999;
     magic_debugging_number = 0L;
-    dt = Bytes.create effective_page_size;
+    dt = Bytes.create page_size;
+  }
+end
+
+module Counter = struct
+  type t = { mutable value: int32 }
+  let create () = { value = 0l }
+  let increment t = t.value <- Int32.succ t.value
+  let reset t = t.value <- 0l
+end
+
+module ContentionTracker = struct
+  type t = {
+    restarts_counter: Counter.t;
+    access_counter: Counter.t;
+    mutable last_modified_pos: int32;
   }
 
-let is_dirty bf = bf.plsn <> bf.last_written_plsn
+  let create () = {
+    restarts_counter = Counter.create ();
+    access_counter = Counter.create ();
+    last_modified_pos = -1l;
+  }
 
-let is_free bf = bf.state = Free
+  let reset t =
+    Counter.reset t.restarts_counter;
+    Counter.reset t.access_counter;
+    t.last_modified_pos <- -1l
+end
 
-let reset bf =
-  bf.crc <- 0L;
-  bf.last_writer_worker_id <- max_int;
-  bf.last_written_plsn <- 0L;
-  bf.state <- Free;
-  bf.is_being_written_back <- false;
-  bf.pid <- 9999L;
-  bf.next_free_bf <- None;
-  bf.contention_tracker <- { restarts_counter = 0; access_counter = 0; last_modified_pos = -1 };
-  bf.keep_in_memory <- false;
+module Header = struct
+  type t = {
+    mutable last_writer_worker_id: worker_id;
+    mutable last_written_plsn: lid;
+    mutable state: state;
+    mutable is_being_written_back: bool;
+    mutable keep_in_memory: bool;
+    mutable pid: pid;
+    mutable latch: Latch.HybridLatch.t;
+    mutable contention_tracker: ContentionTracker.t;
+    mutable crc: int64;
+  }
 
-let update_optimistic_parent_pointer opp new_parent_bf new_parent_pid new_parent_gsn new_swip_ptr new_pos_in_parent =
-  if opp.parent_bf <> new_parent_bf || opp.parent_pid <> new_parent_pid || 
-     opp.parent_plsn <> new_parent_gsn || opp.swip_ptr <> new_swip_ptr || 
-     opp.pos_in_parent <> new_pos_in_parent then
-    begin
-      opp.parent_bf <- new_parent_bf;
-      opp.parent_pid <- new_parent_pid;
-      opp.parent_plsn <- new_parent_gsn;
-      opp.swip_ptr <- new_swip_ptr;
-      opp.pos_in_parent <- new_pos_in_parent
-    end
+  let create () = {
+    last_writer_worker_id = max_int;
+    last_written_plsn = 0L;
+    state = FREE;
+    is_being_written_back = false;
+    keep_in_memory = false;
+    pid = 9999L;
+    latch = Latch.HybridLatch.create 0L;
+    contention_tracker = ContentionTracker.create ();
+    crc = 0L;
+  }
+
+end
+  
+type t = {
+  mutable header : Header.t;
+  mutable page : Page.t;
+}
+
+let create () = {
+  header = Header.create ();
+  page = Page.create ();
+}
+
+let is_dirty t = t.page.plsn <> t.header.last_written_plsn
+
+let is_free t = t.header.state = FREE
+
+let reset t =
+  t.header.crc <- 0L;
+  assert (not t.header.is_being_written_back);
+  Latch.HybridLatch.assert_exclusively_latched t.header.latch;
+  t.header.last_writer_worker_id <- max_int;
+  t.header.last_written_plsn <- 0L;
+  t.header.state <- FREE;
+  t.header.is_being_written_back <- false;
+  t.header.pid <- 9999L;
+  ContentionTracker.reset t.header.contention_tracker;
+  t.header.keep_in_memory <- false;

@@ -1,20 +1,7 @@
-module BufferFrame = struct
-  type t = { mutable data : string }
-end
-
-module FreeList = struct
-  type t = { mutable free : BufferFrame.t list }
-end
+open Lwt.Infix
+module BufferFrame = Buffer_frame
 
 type pid = int64
-type u64 = int64
-type u8 = int
-type s64 = int64
-
-module Config = struct
-  let flags_ssd_gib = ref 0
-  let page_size = 4096
-end
 
 module IOFrame = struct
   type state = Reading | Ready | ToDelete | Undefined
@@ -22,112 +9,163 @@ module IOFrame = struct
   type t = {
     mutable state : state;
     mutable bf : BufferFrame.t option;
-    readers_counter : s64 Atomic.t;
+    mutable readers_counter : int64;
+    mutex : Lwt_mutex.t;
   }
 
-  let create () = 
-    { state = Undefined; bf = None; readers_counter = Atomic.make 0L }
+  let create () = {
+    state = Undefined;
+    bf = None;
+    readers_counter = 0L;
+    mutex = Lwt_mutex.create ();
+  }
+
+  let lock t = Lwt_mutex.lock t.mutex
+
+  let unlock t = Lwt_mutex.unlock t.mutex
 end
 
 module HashTable = struct
   type entry = {
-    key : u64;
+    mutable key : int64;
     mutable next : entry option;
-    value : IOFrame.t;
-  }
-
-  type handler = {
-    mutable holder : entry option ref;
+    mutable value : IOFrame.t;
   }
 
   type t = {
-    mask : u64;
-    entries : entry option array;
+    mutable entries : entry option array;
+    mask : int64;
   }
 
+  type handler = entry option ref
+
   let create size_in_bits =
-    let size = 1 lsl (Int64.to_int size_in_bits) in
-    { mask = Int64.pred (Int64.shift_left 1L (Int64.to_int size_in_bits));
-      entries = Array.make size None }
+    let size = 1 lsl size_in_bits in
+    {
+      entries = Array.make size None;
+      mask = Int64.pred (Int64.shift_left 1L size_in_bits);
+    }
 
   let hash_key t k = Int64.logand k t.mask
 
   let insert t key =
-    let hash = hash_key t key in
-    let new_entry = { key; next = t.entries.(Int64.to_int hash); value = IOFrame.create () } in
-    t.entries.(Int64.to_int hash) <- Some new_entry;
-    new_entry.value
+    let frame = IOFrame.create () in
+    let rec insert_entry idx =
+      match t.entries.(idx) with
+      | None ->
+          let new_entry = { key; next = None; value = frame } in
+          t.entries.(idx) <- Some new_entry;
+          frame
+      | Some entry ->
+          if entry.key = key then
+            entry.value
+          else
+            match entry.next with
+            | None ->
+                let new_entry = { key; next = None; value = frame } in
+                entry.next <- Some new_entry;
+                frame
+            | Some _ -> insert_entry (idx + 1)
+    in
+    insert_entry (Int64.to_int (hash_key t key))
 
   let lookup t key =
-    let hash = hash_key t key in
-    let rec find_entry entry =
-      match entry with
-      | Some e when e.key = key -> Some (ref (Some e))
-      | Some e -> find_entry e.next
+    let rec lookup_entry idx =
+      match t.entries.(idx) with
       | None -> None
+      | Some entry ->
+          if entry.key = key then
+            Some (ref (Some entry))
+          else
+            match entry.next with
+            | None -> None
+            | Some _ -> lookup_entry (idx + 1)
     in
-    { holder = match find_entry t.entries.(Int64.to_int hash) with
-               | Some r -> r
-               | None -> ref None }
+    lookup_entry (Int64.to_int (hash_key t key))
 
-  let remove t handler =
-    match !(handler.holder) with
-    | Some entry ->
-        let hash = hash_key t entry.key in
-        let rec remove_entry prev curr =
-          match curr with
-          | Some e when e.key = entry.key ->
-              (match prev with
-               | Some p -> p.next <- e.next
-               | None -> t.entries.(Int64.to_int hash) <- e.next)
-          | Some e -> remove_entry (Some e) e.next
-          | None -> ()
-        in
-        remove_entry None t.entries.(Int64.to_int hash);
-        handler.holder := None
+  let remove t (handler : handler) =
+    match !handler with
     | None -> ()
+    | Some entry ->
+        let idx = Int64.to_int (hash_key t entry.key) in
+        if t.entries.(idx) == Some entry then
+          t.entries.(idx) <- entry.next
+        else
+          let rec remove_from_list prev =
+            match prev.next with
+            | None -> ()
+            | Some next ->
+                if next == entry then
+                  prev.next <- next.next
+                else
+                  remove_from_list next
+          in
+          match t.entries.(idx) with
+          | None -> ()
+          | Some first -> remove_from_list first;
+        handler := None
+
+  let remove_by_key t key =
+    match lookup t key with
+    | None -> ()
+    | Some handler -> remove t handler
 
   let has t key =
     match lookup t key with
-    | { holder = { contents = Some _ } } -> true
-    | _ -> false
+    | None -> false
+    | Some _ -> true
 end
 
 module Partition = struct
   type t = {
+    ht_mutex : Lwt_mutex.t;
     io_ht : HashTable.t;
-    free_bfs_limit : u64;
+    free_bfs_limit : int64;
     dram_free_list : FreeList.t;
-    pid_distance : u64;
+    pid_distance : int64;
+    pids_mutex : Lwt_mutex.t;
     mutable freed_pids : pid list;
-    mutable next_pid : u64;
+    mutable next_pid : pid;
   }
 
   let create first_pid pid_distance free_bfs_limit =
-    { io_ht = HashTable.create 16L;
+    {
+      ht_mutex = Lwt_mutex.create ();
+      io_ht = HashTable.create 16;
       free_bfs_limit;
-      dram_free_list = { FreeList.free = [] };
+      dram_free_list = FreeList.create ();
       pid_distance;
+      pids_mutex = Lwt_mutex.create ();
       freed_pids = [];
-      next_pid = first_pid }
+      next_pid = first_pid;
+    }
 
   let next_pid t =
-    match t.freed_pids with
-    | pid :: rest ->
-        t.freed_pids <- rest;
-        pid
-    | [] ->
-        let pid = t.next_pid in
-        t.next_pid <- Int64.add t.next_pid t.pid_distance;
-        assert (Int64.div (Int64.mul pid (Int64.of_int Config.page_size)) 1073741824L <= Int64.of_int !(Config.flags_ssd_gib));
-        pid
+    Lwt_mutex.with_lock t.pids_mutex (fun () ->
+      match t.freed_pids with
+      | pid :: rest ->
+          t.freed_pids <- rest;
+          Lwt.return pid
+      | [] ->
+          let pid = t.next_pid in
+          t.next_pid <- Int64.add t.next_pid t.pid_distance;
+          Lwt.return pid
+    )
 
   let free_page t pid =
-    t.freed_pids <- pid :: t.freed_pids
+    Lwt_mutex.with_lock t.pids_mutex (fun () ->
+      t.freed_pids <- pid :: t.freed_pids;
+      Lwt.return_unit
+    )
 
   let allocated_pages t =
     Int64.div t.next_pid t.pid_distance
 
   let freed_pages t =
-    Int64.of_int (List.length t.freed_pids)
+    Lwt_mutex.with_lock t.pids_mutex (fun () ->
+      Lwt.return (Int64.of_int (List.length t.freed_pids))
+    )
+
+  let batch_push t head tail count =
+    FreeList.batch_push t.dram_free_list head tail count
 end
