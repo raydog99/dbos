@@ -260,7 +260,7 @@ module Constraint = struct
     | PrimaryKey
     | ForeignKey of { ref_table: Catalog.oid; ref_columns: string list }
     | Unique
-    | Check of string  (* Check constraint expression *)
+    | Check of string
 
   type constraint_def = {
     oid: Catalog.oid;
@@ -358,10 +358,8 @@ module CatalogManager = struct
   let default_schema_abbreviation = "bf"
 
   let initialize () =
-    (* Create default schema *)
     let default_schema = Schema.create_schema default_schema_name "system" in
     
-    (* Create system catalogs *)
     let create_system_catalogs () =
       let create_system_table name columns =
         match default_schema with
@@ -369,7 +367,6 @@ module CatalogManager = struct
         | None -> failwith "Default schema not found"
       in
       
-      (* Create bf_class equivalent *)
       let _ = create_system_table "bf_class" [
         { name = "oid"; data_type = DataType.Int; is_nullable = false; default_value = None };
         { name = "relname"; data_type = DataType.String (Some 64); is_nullable = false; default_value = None };
@@ -380,7 +377,6 @@ module CatalogManager = struct
         { name = "reltuples"; data_type = DataType.Float; is_nullable = false; default_value = Some "0.0" };
       ] in
 
-      (* Create bf_attribute equivalent *)
       let _ = create_system_table "bf_attribute" [
         { name = "attrelid"; data_type = DataType.Int; is_nullable = false; default_value = None };
         { name = "attname"; data_type = DataType.String (Some 64); is_nullable = false; default_value = None };
@@ -390,14 +386,12 @@ module CatalogManager = struct
         { name = "atthasdef"; data_type = DataType.Bool; is_nullable = false; default_value = Some "false" };
       ] in
 
-      (* Create bf_namespace equivalent *)
       let _ = create_system_table "bf_namespace" [
         { name = "oid"; data_type = DataType.Int; is_nullable = false; default_value = None };
         { name = "nspname"; data_type = DataType.String (Some 64); is_nullable = false; default_value = None };
         { name = "nspowner"; data_type = DataType.Int; is_nullable = false; default_value = None };
       ] in
 
-      (* Create bf_type equivalent *)
       let _ = create_system_table "bf_type" [
         { name = "oid"; data_type = DataType.Int; is_nullable = false; default_value = None };
         { name = "typname"; data_type = DataType.String (Some 64); is_nullable = false; default_value = None };
@@ -425,7 +419,6 @@ module CatalogManager = struct
     let schema_oid = get_schema_oid schema_name in
     let table = Table.create_table schema_oid table_name columns primary_key in
     
-    (* Add entry to bf_class *)
     let bf_class_oid = get_schema_oid default_schema_name in
     let bf_class = Table.find_table_by_name bf_class_oid "bf_class" in
     match bf_class with
@@ -436,11 +429,9 @@ module CatalogManager = struct
           ("relnamespace", string_of_int (Int64.to_int schema_oid));
           ("reltype", "0"); 
           ("relowner", "0"); 
-          ("relkind", "r"); (* 'r' for regular table *)
+          ("relkind", "r");
           ("reltuples", "0.0");
         ] in
-        (* You'd need to implement an insert_row function for Table *)
-        (* Table.insert_row t new_row; *)
         table
     | None -> failwith "System catalog bf_class not found"
 
@@ -450,7 +441,6 @@ module CatalogManager = struct
     | Some table ->
         let index = Index.create_index table.oid index_name columns index_type is_unique in
         
-        (* Add entry to bf_class *)
         let bf_class_oid = get_schema_oid default_schema_name in
         let bf_class = Table.find_table_by_name bf_class_oid "bf_class" in
         (match bf_class with
@@ -461,10 +451,9 @@ module CatalogManager = struct
               ("relnamespace", string_of_int (Int64.to_int schema_oid));
               ("reltype", "0");
               ("relowner", "0");
-              ("relkind", "i"); (* 'i' for index *)
+              ("relkind", "i"); 
               ("reltuples", "0.0");
             ] in
-            (* Table.insert_row t new_row; *)
             ()
         | None -> failwith "System catalog bf_class not found");
         index
@@ -474,26 +463,21 @@ module CatalogManager = struct
     let schema_oid = get_schema_oid schema_name in
     match Table.find_table_by_name schema_oid table_name with
     | Some table ->
-        (* Remove from bf_class *)
         let bf_class_oid = get_schema_oid default_schema_name in
         let bf_class = Table.find_table_by_name bf_class_oid "bf_class" in
         (match bf_class with
         | Some t ->
-            (* Table.delete_row t [("oid", string_of_int (Int64.to_int table.oid))]; *)
             ()
         | None -> failwith "System catalog bf_class not found");
         
-        (* Remove indexes *)
         List.iter (fun index_oid ->
           ignore (Index.delete_index index_oid)
         ) table.indexes;
         
-        (* Remove constraints *)
         List.iter (fun constraint_oid ->
           ignore (Constraint.delete_constraint constraint_oid)
         ) table.constraints;
         
-        (* Remove table *)
         Hashtbl.remove Table.tables table.oid;
         Schema.remove_table_from_schema schema_oid table.oid;
         Catalog.delete_entry table.oid;

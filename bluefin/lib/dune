@@ -1,2 +1,4 @@
 (library
- (name bluefin))
+ (name bluefin)
+ (libraries storage utils)
+ )
